@@ -1,0 +1,1345 @@
+---
+title: "Proposed Models"
+author: "Danny Foster"
+date: "3/14/2022"
+output: html_document
+---
+
+```{r}
+library(here)
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+```
+
+
+# Litter and/or duff
+
+## Model Description
+
+The model for litter and/or duff depths is:
+
+$$Y_i \sim \text{NegBinomial}(\mu_i, \kappa)$$
+
+where:
+
+  - $Y_i$ is the observed depth of litter and/or duff at observation $i$ in 
+  centimeters, rounded to the nearest cm
+  - $\mu_i$ is the unobserved true mean depth at observation $i$
+  - $\kappa$ is the negative binomial dispersion parameter, here assumed constant 
+  across all samples
+  
+$$\text{log}(\mu_i) = \textbf{X}\beta + \textbf{GP}_{l,p} + b_p$$
+
+where:
+
+  - $\textbf{X}$ is the design matrix of fixed effects covariates
+  - $\beta$ are the coefficients for the fixed effects
+  - $\textbf{GP}$ is a matrix of realized gaussian process random effects, $L$ with rows 
+  for the (fixed across plots) spatial locations $l = 1,2,...,L$ and $P$ columns 
+  for the plots p$p = 1,2,...P$. $l$ is the index of the location for the 
+  observation $i$ and $p$ is the index for the plot of of the observation $i$.
+  - $b$ is a vector of normally distributed random effects for the plots, 
+  $b \sim \text{Normal}(0,\sigma_{plot}^2)$, and $b_p$ is the random effect 
+  for plot $p$, the plot associated with observation $i$.
+  
+$$\textbf{GP}_{1:L,p} \sim \text{MVN}(0,\Sigma)$$
+
+where:
+
+  - $\Sigma$ is the $L$ by $L$ covariance matrix of sample locations within 
+  a plot. The gaussian process parameters, and thus the covariance matrix, 
+  are constant within a group of plots. For clarity, we present models for 
+  only a single group. For analyses explicitly comparing multiple fuel 
+  models, various parameters (including $\beta$,
+  $\Sigma$, $\alpha$ and $\rho$) will be allowed to vary by group. 
+  
+$$\Sigma_g = \alpha_g^2 \text{exp}(\frac{-D^2}{2\rho_g^2})$$
+
+where:
+
+  - $\alpha_g$ is the standard deviation of the gaussian process random effect for 
+  group $g$, controlling the strength of the spatial effect
+  - $D^2$ is the $L$ by $L$ matrix of squared distances among all sample locations 
+  $l = 1,...,L$ in a plot
+  - $\rho_g$ is the length-scale parameter of the gaussian process random effect 
+  for group $g$, 
+  controlling the rate at which the correlation between observations decays 
+  as the distance between them increases
+
+
+## Simulate Sample Data
+
+```{r}
+set.seed(112188)
+
+#### data structure ############################################################
+G = 1 # 1 group
+L = 64 # 64 subsamples within each plot
+P = 10 # 10 plots
+N = L*P # total number of observations
+
+# within-plot sample locations, coordinates in meters relative to plot center
+sample_coords = 
+  data.frame(x_coord = 
+               c(-29.5, -19.5, -9.5, -7.5, -7, -5.5, -4.5, -4, -3.5, -3, 
+                 -2.5, -2.4, -2.3, -2.2, -2.1, -2, 2, 2.1, 2.2, 2.3, 2.4, 2.5,
+                 3, 3.5, 4, 4.5, 5.5, 7, 7.5, 9.5, 19.5, 29.5,
+                 rep(0, times = 32)),
+             y_coord = 
+               c(rep(0, times = 32), 
+                 -29.5, -19.5, -9.5, -7.5, -7, -5.5, -4.5, -4, -3.5, -3, 
+                 -2.5, -2.4, -2.3, -2.2, -2.1, -2, 2, 2.1, 2.2, 2.3, 2.4, 2.5,
+                 3, 3.5, 4, 4.5, 5.5, 7, 7.5, 9.5, 19.5, 29.5))
+
+# vector of location IDs for within-plot sample locations
+location_id = 
+  rep(x = 1:L, times = P)
+
+# vector of plot IDs for within-plot sample locations
+plot_id = 
+  sapply(X = 1:P,
+         FUN = function(p){
+           rep(p, times = L)
+         }) %>%
+  as.numeric()
+
+# vector of group IDs for each plot
+group_id = rep(1, times = P)
+
+# design matrix for fixed effects
+X = 
+  data.frame(
+    intercept = rep(1, times = N)
+  ) %>%
+  as.matrix()
+
+
+
+#### parameters ################################################################
+
+
+# fixed effects coefficients; here group means are the only fixed effects
+#beta = rnorm(n = G, mean = 0, sd = 2) 
+beta = c(2.5)
+  
+  
+# standard deviation of the plot random effect
+#sigmaPlot = rnorm(n = 1, mean = 0, sd = 2)
+sigmaPlot = 0.25
+
+
+# negative binomial dispersion parameter
+#kappa = rcauchy(n = 1, location = 0, scale = 5)
+#while (kappa<=0){
+#  kappa = rcauchy(n = 1, location = 0, scale = 5)
+#}
+kappa = 1
+
+
+
+# standard deviation of the GP random effect for group g
+#alpha = truncnorm::rtruncnorm(n = G, a = 0, b = Inf, mean = 0, sd = 0.5)
+alpha = c(0.5)
+
+
+# length scale of the GP random effect for group g
+#rho = invgamma::rinvgamma(n = G, shape = 5, rate = 40)
+rho = c(4)
+
+
+#### random effects realizations ###############################################
+
+# matrix of within-plot pairwise distances
+D = dist(sample_coords) %>% as.matrix()
+
+# within-plot covariance matrices, one for each group
+K = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = 
+          sapply(X = 1:G,
+                 FUN = function(g){
+                   
+                   sapply(X = 1:L,
+                          FUN = function(l){
+                            
+                            sapply(X = 1:L,
+                                   FUN = function(lprime){
+                                     #paste0('G:',g,'L:',l,'Lp:',lprime)
+                                     alpha[g]**2 * 
+                                       exp(-(D[lprime,l]**2)/
+                                             (2*rho[g]**2))
+                                   })
+                          })
+                   
+                 }))
+
+# add a small noise term to ensure positive definiteness
+for (g in 1:G){
+  K[,,g] = K[,,g]+diag(x = 1e-9, nrow = L, ncol = L)
+}
+
+# cholesky decompositions of the covariance matrices, one for each group
+KL = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = sapply(X = 1:G,
+                      FUN = function(g){
+                        
+                        t(chol(K[,,g]))
+                        
+                      }))
+
+# standard normal deviates for spatial random effects
+zGP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = rnorm(n = L*P, mean = 0, sd = 1))
+
+# realized spatial random effects
+GP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = 
+           sapply(X = 1:P,
+                  FUN = function(p){
+                    KL[,,group_id[p]] %*% zGP[,p]
+                  }))
+
+# realized plot random effects
+plot_effects = sigmaPlot * rnorm(n = P, mean = 0, sd = 1)
+
+#### linear predictors and responses ###########################################
+
+logmu = 
+  # fixed effects
+  X %*% beta +
+  # spatial random effect
+  sapply(X = 1:N,
+         FUN = function(i){GP[location_id[i],plot_id[i]]}) +
+  
+  # plot random effect
+  sapply(X = 1:N,
+         FUN = function(i){plot_effects[plot_id[i]]})
+
+Y = rnbinom(n = N, size = kappa, mu = exp(logmu))
+
+hist(Y)
+ggplot(data = data.frame(Y),
+       aes(x = Y))+
+  geom_histogram()+
+  scale_x_continuous(limits = c(0, 100))
+
+```
+
+
+## Estimate Parameters
+
+Assemble model data object and compile stan model:
+
+```{r}
+
+data.litterduff = 
+  list(N = N,
+       P = P,
+       L = L,
+       G = G,
+       J = G,
+       
+       Y = Y,
+       plot_id = plot_id,
+       location_id = location_id,
+       group_id = group_id,
+       
+       X = X,
+       coords = sample_coords)
+
+
+stan_model.litterduff = cmdstan_model(here::here('03-analysis',
+                                      'litterduff_depths.stan'))
+
+```
+
+Estimate parameters:
+
+```{r}
+
+litterduff_fit = stan_model.litterduff$sample(data = data.litterduff,
+                                   parallel_chains = 4,
+                                   output_dir = 
+                                     here::here('02-data', '06-results', 'demo'),
+                                   output_basename = 'litterduff',
+                                   seed = 112188,
+                                   adapt_delta = 0.9)
+
+
+```
+
+Model diagnostics:
+
+```{r}
+
+litterduff_fit$cmdstan_diagnose()
+
+litterduff_fit$summary(c('beta', 'alpha', 'rho',
+                         'sigmaPlot', 'kappa')) %>%
+  print(n = Inf)
+
+
+litterduff_fit$save_object(here::here('02-data', '06-results', 'demo', 
+                                      'litterduff_fit.rds'))
+
+```
+
+Posterior distributions vs. real values:
+
+```{r}
+litterduff_draws = litterduff_fit$draws(
+                         variables = c('alpha', 'rho','beta',
+                                                     'sigmaPlot', 'kappa')) %>%
+  as_draws_df()
+
+head(litterduff_draws)
+
+ggplot(data = litterduff_draws,
+       aes(x = `alpha[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = alpha,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = litterduff_draws,
+       aes(x = `rho[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = rho,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = litterduff_draws,
+       aes(x = `beta[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = beta,
+             color = 'red')+
+  theme_minimal()
+
+
+ggplot(data = litterduff_draws,
+       aes(x = kappa))+
+  geom_histogram()+
+  geom_vline(xintercept = kappa,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = litterduff_draws,
+       aes(x = sigmaPlot))+
+  geom_histogram()+
+  geom_vline(xintercept = sigmaPlot,
+             color = 'red')+
+  theme_minimal()
+
+```
+
+Looks good.
+
+
+# Woody Debris
+
+
+## Model Description
+
+There are two submodels in the woody debris model. The first models the 
+tally of woody debris particles intersecting the transect, and is very similar 
+to the litter/duff model. The second submodel models the diameter of the 
+woody debris particles using a gamma distribution. 
+
+### Particle Tallies
+
+The model for woody debris tallies is:
+
+$$Y_i \sim \text{NegBinomial}(\mu_i, \kappa)$$
+
+where:
+
+  - $Y_i$ is the observed count of woody debris particles (1h, 10h, 100h, 1000h) 
+  at observation $i$, which is a 1m subtransect 
+  - $\mu_i$ is the unobserved true mean count at observation $i$
+  - $\kappa$ is the negative binomial dispersion parameter, here assumed constant 
+  across all samples
+
+$$\text{log}(\mu_i) = \textbf{X}\beta + \textbf{GP}_{l,p} + b_p + z_t$$
+
+where:
+
+  - $\textbf{X}$ is the design matrix of fixed effects covariates
+  - $\beta$ are the coefficients for the fixed effects
+  - $\textbf{GP}$ is a matrix of realized gaussian process random effects, $L$ with rows 
+  for the (fixed across plots) spatial locations $l = 1,2,...,L$ and $P$ columns 
+  for the plots p$p = 1,2,...P$. $l$ is the index of the location for the 
+  observation $i$ and $p$ is the index for the plot of of the observation $i$.
+  - $b$ is a vector of normally distributed random effects for the plots, 
+  $b \sim \text{Normal}(0,\sigma_{plot}^2)$, and $b_p$ is the random effect 
+  for plot $p$, the plot associated with observation $i$.
+  - $z$ is a vector of normally distributed random effects for the transects,
+  $z \sim \text{Normal}(0,\sigma_{transect}^2)$, and $z_t$ is the random effect 
+  for transect $t$, the transect associated with observation $i$.
+  
+$$\textbf{GP}_{1:L,p} \sim \text{MVN}(0,\Sigma)$$
+
+where:
+
+  - $\Sigma$ is the $L$ by $L$ covariance matrix of sample locations within 
+  a plot. The gaussian process parameters, and thus the covariance matrix, 
+  are constant within a group of plots. For clarity, we present models for 
+  only a single group. For analyses explicitly comparing multiple fuel 
+  models, various parameters (including $\beta$,
+  $\Sigma$, $\alpha$ and $\rho$) will be allowed to vary by group. 
+  
+$$\Sigma_g = \alpha_g^2 \text{exp}(\frac{-D^2}{2\rho_g^2})$$
+
+where:
+
+  - $\alpha_g$ is the standard deviation of the gaussian process random effect for 
+  group $g$, controlling the strength of the spatial effect
+  - $D^2$ is the $L$ by $L$ matrix of squared distances among all sample locations 
+  $l = 1,...,L$ in a plot
+  - $\rho_g$ is the length-scale parameter of the gaussian process random effect 
+  for group $g$, 
+  controlling the rate at which the correlation between observations decays 
+  as the distance between them increases
+
+
+
+### Particle Diameters
+
+The model for woody particle diameters is:
+
+$$Y_i \sim \text{InvGamma}(\alpha_d, \beta_d)$$
+
+where:
+
+  - $Y_i$ is the log of the particle diameter in mm
+  - $\alpha_d$ is the scale parameter for the diameter model
+  - $\beta_d$ is the rate parameter for the diameter model
+
+## Simulate Sample Data
+
+Woody tallies:
+
+```{r}
+set.seed(112188)
+
+#### data structure ############################################################
+G = 1 # 1 group
+L = 32 # 64 subsamples within each plot
+P = 10 # 10 plots
+NT = P*2 # total number of transects
+N = L*P # total number of observations
+
+# within-plot sample locations, coordinates in meters relative to plot center
+sample_coords = 
+  data.frame(x_coord = 
+               c(-29.5, -19.5, -9.5, -7.5, -5.5, -4.5,  -3.5,  -2.5, 2.5,
+                  3.5, 4.5, 5.5, 7.5, 9.5, 19.5, 29.5,
+                 rep(0, times = 16)),
+             y_coord =  
+               c(rep(0, times = 16),
+                 -29.5, -19.5, -9.5, -7.5, -5.5, -4.5,  -3.5,  -2.5, 2.5,
+                  3.5, 4.5, 5.5, 7.5, 9.5, 19.5, 29.5))
+
+# vector of location IDs for within-plot sample locations
+location_id = 
+  rep(x = 1:L, times = P)
+
+# vector of plot IDs for within-plot sample locations
+plot_id = 
+  sapply(X = 1:P,
+         FUN = function(p){
+           rep(p, times = L)
+         }) %>%
+  as.numeric()
+
+# vector of transect IDs for within plot sample locations
+transect_id = 
+  sapply(X = 1:NT,
+         FUN = function(t){rep(t, times = 16)}) %>%
+  as.numeric()
+
+# vector of group IDs for each plot
+group_id = rep(1, times = P)
+
+# design matrix for fixed effects
+X = 
+  data.frame(
+    intercept = rep(1, times = N)
+  ) %>%
+  as.matrix()
+
+
+
+#### parameters ################################################################
+
+
+# fixed effects coefficients; here group means are the only fixed effects
+#beta = rnorm(n = G, mean = 0, sd = 2) 
+beta = c(3.5)
+  
+  
+# standard deviation of the plot random effect
+#sigmaPlot = rnorm(n = 1, mean = 0, sd = 2)
+sigmaPlot = 0.25
+
+sigmaTransect = 0.1
+
+# negative binomial dispersion parameter
+#kappa = rcauchy(n = 1, location = 0, scale = 5)
+#while (kappa<=0){
+#  kappa = rcauchy(n = 1, location = 0, scale = 5)
+#}
+kappa = 1
+
+
+
+# standard deviation of the GP random effect for group g
+#alpha = truncnorm::rtruncnorm(n = G, a = 0, b = Inf, mean = 0, sd = 0.5)
+alpha = c(0.5)
+
+
+# length scale of the GP random effect for group g
+#rho = invgamma::rinvgamma(n = G, shape = 5, rate = 40)
+rho = c(10)
+
+
+#### random effects realizations ###############################################
+
+# matrix of within-plot pairwise distances
+D = dist(sample_coords) %>% as.matrix()
+
+# within-plot covariance matrices, one for each group
+K = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = 
+          sapply(X = 1:G,
+                 FUN = function(g){
+                   
+                   sapply(X = 1:L,
+                          FUN = function(l){
+                            
+                            sapply(X = 1:L,
+                                   FUN = function(lprime){
+                                     #paste0('G:',g,'L:',l,'Lp:',lprime)
+                                     alpha[g]**2 * 
+                                       exp(-(D[lprime,l]**2)/
+                                             (2*rho[g]**2))
+                                   })
+                          })
+                   
+                 }))
+
+# add a small noise term to ensure positive definiteness
+for (g in 1:G){
+  K[,,g] = K[,,g]+diag(x = 1e-9, nrow = L, ncol = L)
+}
+
+# cholesky decompositions of the covariance matrices, one for each group
+KL = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = sapply(X = 1:G,
+                      FUN = function(g){
+                        
+                        t(chol(K[,,g]))
+                        
+                      }))
+
+# standard normal deviates for spatial random effects
+zGP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = rnorm(n = L*P, mean = 0, sd = 1))
+
+# realized spatial random effects
+GP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = 
+           sapply(X = 1:P,
+                  FUN = function(p){
+                    KL[,,group_id[p]] %*% zGP[,p]
+                  }))
+
+# realized plot random effects
+plot_effects = sigmaPlot * rnorm(n = P, mean = 0, sd = 1)
+
+# realized transect random effects
+transect_effects = sigmaTransect *rnorm(n = NT, mean = 0, sd = 1)
+
+#### linear predictors and responses ###########################################
+
+logmu = 
+  # fixed effects
+  X %*% beta +
+  # spatial random effect
+  sapply(X = 1:N,
+         FUN = function(i){GP[location_id[i],plot_id[i]]}) +
+  
+  # plot random effect
+  sapply(X = 1:N,
+         FUN = function(i){plot_effects[plot_id[i]]}) +
+  
+  # transect random effect
+  sapply(X = 1:N,
+         FUN = function(i){transect_effects[transect_id[i]]})
+
+Y = rnbinom(n = N, size = kappa, mu = exp(logmu))
+
+hist(Y)
+ggplot(data = data.frame(Y),
+       aes(x = Y))+
+  geom_histogram()
+
+data.woody_tallies = 
+  list(N = N,
+       P = P,
+       NT = NT,
+       L = L,
+       G = G,
+       J = G,
+       Y = Y,
+       plot_id = plot_id,
+       location_id = location_id,
+       transect_id = transect_id,
+       group_id = group_id,
+       
+       X = X,
+       coords = sample_coords)
+
+
+```
+
+Woody diameters:
+
+```{r}
+set.seed(110819)
+
+#### data structure ############################################################
+
+G = 1
+P = 10
+N = 1800 # similar to the actual data we have
+J = G
+
+# vector of plot IDs for within-plot sample locations
+plot_id = 
+  sapply(X = 1:P,
+         FUN = function(p){
+           rep(p, times = N/P)
+         }) %>%
+  as.numeric()
+
+# vector of group IDs for each plot
+group_id = rep(1, times = P)
+
+# design matrix for fixed effects
+X = 
+  data.frame(
+    intercept = rep(1, times = N)
+  ) %>%
+  as.matrix()
+
+#### parameter values ##########################################################
+
+alpha = c(1)
+beta = c(2)
+
+#### random effects realizations ###############################################
+
+#### linear predictors and responses ###########################################
+
+
+Y = 
+  sapply(X = 1:N,
+         FUN = function(i){
+           invgamma::rinvgamma(n = 1, 
+                               shape = alpha[group_id[plot_id]], 
+                               rate = beta[group_id[plot_id]])
+         }) %>%
+  as.numeric()
+
+hist(Y)
+data.woody_diams = 
+  list(N = N,
+       P = P,
+       G = G,
+       J = J,
+       X = X,
+       
+       group_id = group_id,
+       plot_id = plot_id,
+       
+       Y = Y)
+
+
+```
+
+## Estimate Parameters
+
+Compile stan models:
+
+```{r}
+
+
+
+stan_model.woody_tallies = cmdstan_model(here::here('03-analysis',
+                                      'woody_tallies.stan'))
+
+stan_model.woody_diams = cmdstan_model(here::here('03-analysis',
+                                                  'woody_diams.stan'))
+
+```
+
+Estimate parameters:
+
+```{r}
+
+woody_tallies_fit = stan_model.woody_tallies$sample(data = data.woody_tallies,
+                                   parallel_chains = 4,
+                                   output_dir = 
+                                     here::here('02-data', '06-results', 'demo'),
+                                   output_basename = 'woodytallies',
+                                   seed = 112188)
+
+woody_diams_fit = 
+  stan_model.woody_diams$sample(data = data.woody_diams,
+                                parallel_chains = 4,
+                                output_dir = 
+                                  here::here('02-data', '06-results', 'demo'),
+                                output_basename = 'woodydiams',
+                                seed = 110819)
+
+```
+
+Model diagnostics:
+
+```{r}
+
+woody_tallies_fit$cmdstan_diagnose()
+
+woody_tallies_fit$summary(c('beta', 'alpha', 'rho',
+                         'sigmaPlot', 'kappa')) %>%
+  print(n = Inf)
+
+
+woody_tallies_fit$save_object(here::here('02-data', '06-results', 'demo', 
+                                      'woody_tallies_fit.rds'))
+
+```
+
+Posterior distributions vs. real values:
+
+```{r}
+woody_tallies_draws = woody_tallies_fit$draws(
+                         variables = c('alpha', 'rho','beta',
+                                                     'sigmaPlot', 
+                                       'sigmaTransect','kappa')) %>%
+  as_draws_df()
+
+head(woody_tallies_draws)
+
+ggplot(data = woody_tallies_draws,
+       aes(x = `alpha[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = alpha,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = woody_tallies_draws,
+       aes(x = `rho[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = rho,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = woody_tallies_draws,
+       aes(x = `beta[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = beta,
+             color = 'red')+
+  theme_minimal()
+
+
+ggplot(data = woody_tallies_draws,
+       aes(x = kappa))+
+  geom_histogram()+
+  geom_vline(xintercept = kappa,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = woody_tallies_draws,
+       aes(x = sigmaPlot))+
+  geom_histogram()+
+  geom_vline(xintercept = sigmaPlot,
+             color = 'red')+
+  theme_minimal()
+
+```
+
+Looks good.
+
+
+```{r}
+
+woody_diams_fit$cmdstan_diagnose()
+
+woody_diams_fit$summary(c('alpha', 'beta')) %>%
+  print(n = Inf)
+
+
+woody_diams_fit$save_object(here::here('02-data', '06-results', 'demo', 
+                                      'woody_diams_fit.rds'))
+
+```
+
+Posterior distributions vs. real values:
+
+```{r}
+woody_diams_draws = woody_diams_fit$draws(
+                         variables = c('alpha', 'beta')) %>%
+  as_draws_df()
+
+head(woody_diams_draws)
+
+
+ggplot(data = woody_diams_draws,
+       aes(x = `alpha[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = alpha,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = woody_diams_draws,
+       aes(x = `beta[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = beta,
+             color = 'red')+
+  theme_minimal()
+
+
+```
+
+Looks good.
+
+# Understory Vegetation
+
+## Model Description
+
+The understory vegetation model treats understory vegetation as binomial 
+distribution, where the number of trials is the number of horizontal 0.25m 
+layers in which vegetation could be present, and the number of successes is 
+the number of layers (counting up from the ground) in which vegetation was 
+actually present. 
+
+$$Y_i \sim \text{Binomial}(M,\eta_i)$$
+
+where:
+
+  - $Y_i$ is the number of layers in which vegetation is present at sample $i$,
+  $0 \leq Y_i \leq M$
+  - $M$ is the maximum number of layers in which understory vegetation was 
+  tested (maximum height of 3.5m divided into 0.25m segments = 14 layers, so 
+  $M=14$ for all locations
+  - $\eta_i$ is the per-layer probability of presence
+  
+$\eta$ is linked to a linear predictor via a logit link:  
+
+$$\text{logit}(\eta) = \textbf{X}\beta_H + \textbf{GP}_H + b_H$$
+
+With the design matrix $\textbf{X}$, fixed effects coefficients $\beta$,
+gaussian process random effects $\textbf{GP}$, and plot-level random effects 
+$b$ all as defined above.
+
+## Simulate Sample Data
+
+```{r}
+set.seed(110819)
+
+#### data structure ############################################################
+G = 1 # 1 group
+L = 60 # 64 subsamples within each plot
+P = 10 # 10 plots
+N = L*P # total number of observations
+M = 14 # maximum number of layers (counting up from the ground) in which vegetation is present
+
+
+# within-plot sample locations, coordinates in meters relative to plot center
+sample_coords = 
+  data.frame(x_coord = 
+               c(seq(-14.5, 14.5, 1),
+                 rep(0, times = 30)),
+             y_coord =  
+               c(rep(0, times = 30),
+                 seq(-14.5, 14.5, 1)))
+
+# vector of location IDs for within-plot sample locations
+location_id = 
+  rep(x = 1:L, times = P)
+
+# vector of plot IDs for within-plot sample locations
+plot_id = 
+  sapply(X = 1:P,
+         FUN = function(p){
+           rep(p, times = L)
+         }) %>%
+  as.numeric()
+
+# vector of group IDs for each plot
+group_id = rep(1, times = P)
+
+# design matrix for fixed effects
+X = 
+  data.frame(
+    intercept = rep(1, times = N)
+  ) %>%
+  as.matrix()
+
+
+
+#### parameters ################################################################
+
+
+# fixed effects coefficients; here group means are the only fixed effects
+#beta = rnorm(n = G, mean = 0, sd = 2) 
+beta = c(0.5)
+  
+# standard deviation of the plot random effect
+#sigmaPlot = rnorm(n = 1, mean = 0, sd = 2)
+sigmaPlot = 0.1
+
+# standard deviation of the GP random effect for group g
+#alpha = truncnorm::rtruncnorm(n = G, a = 0, b = Inf, mean = 0, sd = 0.5)
+alpha = c(1)
+
+
+# length scale of the GP random effect for group g
+#rho = invgamma::rinvgamma(n = G, shape = 5, rate = 40)
+rho = c(10)
+
+#### random effects realizations ###############################################
+
+# matrix of within-plot pairwise distances
+D = dist(sample_coords) %>% as.matrix()
+
+# within-plot covariance matrices, one for each group
+K = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = 
+          sapply(X = 1:G,
+                 FUN = function(g){
+                   
+                   sapply(X = 1:L,
+                          FUN = function(l){
+                            
+                            sapply(X = 1:L,
+                                   FUN = function(lprime){
+                                     #paste0('G:',g,'L:',l,'Lp:',lprime)
+                                     alpha[g]**2 * 
+                                       exp(-(D[lprime,l]**2)/
+                                             (2*rho[g]**2))
+                                   })
+                          })
+                   
+                 }))
+
+# add a small noise term to ensure positive definiteness
+for (g in 1:G){
+  K[,,g] = K[,,g]+diag(x = 1e-9, nrow = L, ncol = L)
+}
+
+# cholesky decompositions of the covariance matrices, one for each group
+KL = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = sapply(X = 1:G,
+                      FUN = function(g){
+                        
+                        t(chol(K[,,g]))
+                        
+                      }))
+
+# standard normal deviates for spatial random effects
+zGP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = rnorm(n = L*P, mean = 0, sd = 1))
+
+# realized spatial random effects
+GP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = 
+           sapply(X = 1:P,
+                  FUN = function(p){
+                    KL[,,group_id[p]] %*% zGP[,p]
+                  }))
+
+# realized plot random effects
+plot_effects = sigmaPlot * rnorm(n = P, mean = 0, sd = 1)
+
+
+#### linear predictors and responses ###########################################
+
+# presence absence
+logit_eta = 
+  # fixed effects 
+  X %*% beta +
+  # spatial random effect
+  sapply(X = 1:N,
+         FUN = function(i){GP[location_id[i],plot_id[i]]}) +
+  
+  # plot random effect
+  sapply(X = 1:N,
+         FUN = function(i){plot_effects[plot_id[i]]})
+
+
+Y = 
+  rbinom(n = N, size = 14, prob = boot::inv.logit(logit_eta))
+  
+  
+
+hist(Y)
+ggplot(data = data.frame(Y),
+       aes(x = Y))+
+  geom_histogram()
+
+data.veg = 
+  list(N = N,
+       M = M,
+       P = P,
+       L = L,
+       G = G,
+       J = G,
+       Y = Y,
+       plot_id = plot_id,
+       location_id = location_id,
+       group_id = group_id,
+       
+       X = X,
+       coords = sample_coords)
+
+
+```
+
+
+
+## Estimate Parameters
+
+Compile stan models:
+
+```{r}
+
+stan_model.veg = cmdstan_model(here::here('03-analysis',
+                                      'veg_heights.stan'))
+
+```
+
+Estimate parameters:
+
+```{r}
+
+veg_fit = stan_model.veg$sample(data = data.veg,
+                                   parallel_chains = 4,
+                                   output_dir = 
+                                     here::here('02-data', '06-results', 'demo'),
+                                   output_basename = 'veg',
+                                   seed = 110819,
+                                adapt_delta = 0.95)
+
+```
+
+Model diagnostics:
+
+```{r}
+
+veg_fit$cmdstan_diagnose()
+
+veg_fit$summary(c('beta', 'alpha', 'rho',
+                         'sigmaPlot')) %>%
+  print(n = Inf)
+
+
+veg_fit$save_object(here::here('02-data', '06-results', 'demo', 
+                                      'veg_fit.rds'))
+
+```
+
+Posterior distributions vs. real values:
+
+```{r}
+veg_draws = veg_fit$draws(
+                         variables = c('beta', 'alpha', 'rho',
+                         'sigmaPlot')) %>%
+  as_draws_df()
+
+head(veg_draws)
+
+ggplot(data = veg_draws,
+       aes(x = `alpha[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = alpha,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = veg_draws,
+       aes(x = `rho[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = rho,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = veg_draws,
+       aes(x = `beta[1]`))+
+  geom_histogram()+
+  geom_vline(xintercept = beta,
+             color = 'red')+
+  theme_minimal()
+
+ggplot(data = veg_draws,
+       aes(x = sigmaPlot))+
+  geom_histogram()+
+  geom_vline(xintercept = sigmaPlot,
+             color = 'red')+
+  theme_minimal()
+
+
+```
+
+Looks pretty good.
+
+
+# Saplings and Trees
+
+## Model Description
+
+## Simulate Sample Data
+
+## Estimate Parameters
+
+
+# Simulate fuelbeds based on real data
+
+## Litter and duff
+
+Extract posterior median parameter values estimated from actual data:
+
+```{r}
+litterduff_real_params = 
+  readRDS(here::here('02-data',
+                     '06-results',
+                     'real_fits',
+                     'litterduff_fit.rds'))$draws(
+                       
+                       variables = c('alpha[1]', 'rho[1]','beta[1]',
+                                                     'alpha[2]', 'rho[2]','beta[2]',
+                                                     'alpha[3]', 'rho[3]','beta[3]',
+                                                     'sigmaPlot', 'kappa')) %>%
+  as_draws_df() %>%
+  summarise_all(median)
+                       
+```
+
+Simulate based on these realistic parameter values:
+
+```{r}
+set.seed(112188)
+
+#### data structure ############################################################
+G = 3 # 2 groups
+L = 1156 # 64 subsamples within each plot
+P = 3 #
+N = L*P # total number of observations
+
+# within-plot sample locations, coordinates in meters relative to plot center
+grid_coords_small = 
+  expand.grid(x_coord = seq(from = 0, to = 10, by = 0.3),
+              y_coord = seq(from = 0, to = 10, by = 0.3))
+
+# vector of location IDs for within-plot sample locations
+location_id = 
+  rep(x = 1:L, times = P)
+
+# vector of plot IDs for within-plot sample locations
+plot_id = 
+  sapply(X = 1:P,
+         FUN = function(p){
+           rep(p, times = L)
+         }) %>%
+  as.numeric()
+
+# vector of group IDs for each plot
+group_id = rep(1:3, times = P/3)
+
+# design matrix for fixed effects
+X = 
+  data.frame(
+    intercept = rep(1, times = N),
+    group2 = ifelse(group_id[plot_id]==2,1,0),
+    group3 = ifelse(group_id[plot_id]==3,1,0)
+  ) %>%
+  as.matrix()
+
+
+
+#### parameters ################################################################
+
+
+# fixed effects coefficients; here group means are the only fixed effects
+#beta = rnorm(n = G, mean = 0, sd = 2) 
+beta = c(litterduff_real_params$`beta[1]`,
+         litterduff_real_params$`beta[2]`,
+         litterduff_real_params$`beta[3]`)
+  
+  
+# standard deviation of the plot random effect
+#sigmaPlot = rnorm(n = 1, mean = 0, sd = 2)
+sigmaPlot = litterduff_real_params$sigmaPlot
+
+
+# negative binomial dispersion parameter
+#kappa = rcauchy(n = 1, location = 0, scale = 5)
+#while (kappa<=0){
+#  kappa = rcauchy(n = 1, location = 0, scale = 5)
+#}
+kappa = litterduff_real_params$kappa
+
+
+
+# standard deviation of the GP random effect for group g
+#alpha = truncnorm::rtruncnorm(n = G, a = 0, b = Inf, mean = 0, sd = 0.5)
+alpha = c(litterduff_real_params$`alpha[1]`,
+          litterduff_real_params$`alpha[2]`,
+          litterduff_real_params$`alpha[3]`)
+
+
+# length scale of the GP random effect for group g
+#rho = invgamma::rinvgamma(n = G, shape = 5, rate = 40)
+rho = c(litterduff_real_params$`rho[1]`,
+        litterduff_real_params$`rho[2]`,
+        litterduff_real_params$`rho[3]`)
+
+
+#### random effects realizations ###############################################
+
+# matrix of within-plot pairwise distances
+D = dist(grid_coords_small) %>% as.matrix()
+
+# within-plot covariance matrices, one for each group
+K = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = 
+          sapply(X = 1:G,
+                 FUN = function(g){
+                   
+                   sapply(X = 1:L,
+                          FUN = function(l){
+                            
+                            sapply(X = 1:L,
+                                   FUN = function(lprime){
+                                     #paste0('G:',g,'L:',l,'Lp:',lprime)
+                                     alpha[g]**2 * 
+                                       exp(-(D[lprime,l]**2)/
+                                             (2*rho[g]**2))
+                                   })
+                          })
+                   
+                 }))
+
+# add a small noise term to ensure positive definiteness
+for (g in 1:G){
+  K[,,g] = K[,,g]+diag(x = 1e-9, nrow = L, ncol = L)
+}
+
+# cholesky decompositions of the covariance matrices, one for each group
+KL = 
+  array(dim = c(L, L, G),
+        dimnames = list('l' = 1:L,
+                        'lprime' = 1:L,
+                        'g' = 1:G),
+        data = sapply(X = 1:G,
+                      FUN = function(g){
+                        
+                        t(chol(K[,,g]))
+                        
+                      }))
+
+# standard normal deviates for spatial random effects
+zGP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = rnorm(n = L*P, mean = 0, sd = 1))
+
+# realized spatial random effects
+GP = 
+  matrix(nrow = L, ncol = P, byrow = FALSE,
+         data = 
+           sapply(X = 1:P,
+                  FUN = function(p){
+                    KL[,,group_id[p]] %*% zGP[,p]
+                  }))
+
+# realized plot random effects
+plot_effects = sigmaPlot * rnorm(n = P, mean = 0, sd = 1)
+
+#### linear predictors and responses ###########################################
+
+logmu = 
+  # fixed effects
+  X %*% beta +
+  # spatial random effect
+  sapply(X = 1:N,
+         FUN = function(i){GP[location_id[i],plot_id[i]]}) +
+  
+  # plot random effect
+  sapply(X = 1:N,
+         FUN = function(i){plot_effects[plot_id[i]]})
+
+Y = rnbinom(n = N, size = kappa, mu = exp(logmu))
+
+hist(Y)
+ggplot(data = data.frame(Y),
+       aes(x = Y))+
+  geom_histogram()+
+  scale_x_continuous(limits = c(0, 100))
+
+
+sim_grid = 
+  X %>%
+  as.data.frame() %>%
+  mutate(location_id = location_id,
+          plot_id = plot_id,
+         Y = Y) %>%
+  left_join(grid_coords_small %>%
+              mutate(location_id = 1:L))
+
+ggplot(data = sim_grid,
+       aes(x = x_coord, y = y_coord, fill = Y))+
+  geom_tile()+
+  scale_fill_viridis_c()+
+  theme_minimal()+
+  facet_wrap(~plot_id)+
+  coord_fixed()+
+  labs(fill = 'Litter+duff depth (cm)')
+
+```
+
+

@@ -1,0 +1,278 @@
+---
+title: "Trees as Point Patterns"
+author: "Danny Foster"
+date: "12/27/2021"
+output: html_document
+---
+
+Using the `spatstat` package to analyze the spatial distribution of trees 
+from crystal cave road as realizations of point pattern processes.
+
+# Setup
+
+Load packages and data from SEKI:
+
+```{r}
+library(here)
+library(tidyverse)
+library(spatstat)
+
+treelist = 
+  readRDS(here::here('02-data', '04-geolocated', 'seki_trees.rds')) %>%
+  # left join in the metadata to get the plot centers
+  left_join(
+    readRDS(here::here('02-data', '04-geolocated', 'seki_metadata.rds')) %>%
+      select(plot_id, x_center, y_center, mort) %>%
+      group_by(plot_id, mort, x_center, y_center) %>%
+      summarise() %>%
+      ungroup()
+  ) %>%
+  # and get the within-plot coordinates of each tree
+  mutate(x_rel = x_coord-x_center,
+         y_rel = y_coord-y_center)
+
+
+
+summary(treelist)
+
+trees = 
+  treelist %>%
+  filter(dbh_cm >= 11.4)
+
+saplings = 
+  treelist %>%
+  filter(dbh_cm < 11.4)
+
+```
+
+# Data munging
+
+`spatstat` has its own set of data objects that it uses, so step one is 
+to convert the trees data (which is a treelist with coordinates) into 
+a set of point patterns (a "hyperframe") and construct a "window" object to 
+represent the plot area. 
+
+```{r}
+# rejects 5 trees which occur right on the plot boundary, which is OK 
+trees.solist = 
+  lapply(X = unique(trees$plot_id)[order(unique(trees$plot_id))],
+         FUN = function(p){
+           trees_in_plot = trees %>% filter(plot_id==p)
+           trees_as_ppp = 
+             ppp(x = trees_in_plot$x_rel,
+                 y = trees_in_plot$y_rel,
+                 marks = trees_in_plot %>% select(dbh_cm, status),
+                 # plot area, constructed of two 30x10m rectangles
+                 window = as.owin(layered(as.owin(c(-15, 15, -5, 5)),
+                                        as.owin(c(-5, 5, -15, 15)))))
+         }) %>%
+  # convert to a list of spatial objects
+  as.solist()
+
+saplings.solist = 
+  lapply(X = unique(saplings$plot_id)[order(unique(saplings$plot_id))],
+         FUN = function(p){
+           saplings_in_plot = saplings %>% filter(plot_id==p)
+           saplings_as_ppp = 
+             ppp(x = saplings_in_plot$x_rel,
+                 y = saplings_in_plot$y_rel,
+                 marks = saplings_in_plot %>% select(dbh_cm, status),
+                 # plot area, constructed of two 30x10m rectangles
+                 window = as.owin(layered(as.owin(c(-15, 15, -1, 1)),
+                                        as.owin(c(-1, 1, -15, 15)))))
+         }) %>%
+  # convert to a list of spatial objects
+  as.solist()
+
+trees_plot_info = 
+  trees %>%
+  group_by(plot_id, mort) %>%
+  summarise() %>%
+  ungroup()
+
+saplings_plot_info = 
+  saplings %>%
+  group_by(plot_id, mort) %>%
+  summarise() %>%
+  ungroup()
+
+#plot the point pattern for a single plot
+plot(trees.solist[[1]])
+plot(saplings.solist[[1]])
+
+
+trees.hyperframe = 
+  hyperframe(pattern = trees.solist,
+             plot_id = trees_plot_info$plot_id,
+             mort = trees_plot_info$mort)
+
+saplings.hyperframe = 
+  hyperframe(pattern = saplings.solist,
+             plot_id = saplings_plot_info$plot_id,
+             mort = saplings_plot_info$mort)
+
+
+# plot the point pattern for all plots (can't get the marks to show here)
+plot(trees.hyperframe$pattern, use.marks = FALSE)
+
+plot(saplings.hyperframe$pattern, use.marks = FALSE)
+
+```
+
+Little weird that its plotting them at slightly different zooms.
+
+# Basic data exploration
+
+Just using some of the builtin summary functions from spatstat:
+
+```{r}
+summary(trees.hyperframe$pattern)
+summary(saplings.hyperframe$pattern)
+```
+
+We can also plot the predicted underlying intensity kernel for each windows. 
+These images assume the range parameter for the underlying intensity function 
+is 3.75m (1/8th the window range). 
+
+```{r}
+plot(density(trees.hyperframe$pattern))
+```
+
+The package includes several methods of estimating the true bandwidth, which 
+overlaps with our GP work on surface fuels.
+
+Here are intensity surfaces using the DBHs as weights:
+
+```{r}
+plot(density(trees.hyperframe$pattern$`1`,
+             weights = trees.hyperframe$pattern$`1`$marks$dbh_cm))
+```
+
+# Basic measures of interpoint correlation
+
+We can estimate ripley's $K$ ($K(r)$ is the number of neighbors expected 
+within distance $r$ for a pattern) for each plot, and compare it to ripley's 
+$K$ for spatially random patterns (no interpoint interaction):
+
+
+```{r}
+lapply(X = 1:length(trees.solist),
+       FUN= function(i){
+         plot(envelope(trees.solist[[i]], Kest, nsim = 99, fix.n = TRUE))
+       })
+lapply(X = 1:length(saplings.solist),
+       FUN= function(i){
+         plot(envelope(saplings.solist[[i]], Kest, nsim = 99, fix.n = TRUE))
+       })
+
+```
+
+Most of the plots' $K$ functions (black lines) are within the envelope of 
+plausible $K$ values generated by completely random simulations (grey bounds), 
+though there are a few that exhibit "significant" clustering or randomness. 
+(This sort of scanning for deviations from the null hypothesis reeks of 
+data dredging; a more formal analysis would call for pre-specifying a 
+specific range of distances we want to test.) 
+
+This exploration suggests that the within-plot distribution of trees is not
+inconsistent with randomness. 
+This would be convenient (simulation is easy!) but boring, and doesn't seem 
+very plausible ecologically (there are ecological processes like 
+reproduction and competition which we would expect to generate clustering 
+or dispersion, respectively). We're also interested in knowing whether the 
+process generating the spatial distribution of trees varies across classes of 
+drought mortality. 
+
+More of the sapling patterns exhibit clustering.
+
+# Using the USGS demography plots
+
+## Comparing plot locations with drought mortality levels
+
+```{r}
+library(here)
+library(sf)
+library(raster)
+library(tidyverse)
+
+usgs_plots = 
+  st_read(here::here('02-data',
+                       '00-source',
+                       'usgs',
+                       'Boundary Polygons.gdb'),
+            layer = 'allplotscombined') %>%
+  
+  st_intersection(
+    st_read(here::here('02-data',
+                       '00-source',
+                       'seki_dx',
+                       'dxstudyarea.shp'))
+  )
+
+usgs_plots
+
+mort_categories = 
+  st_read(here::here('02-data',
+                     '02-intermediate',
+                     'intermediate_plot_location_files',
+                     'mort_categories.shp'))
+
+
+library(tmap)
+tmap_mode('view')
+tm_shape(mort_categories)+
+  tm_polygons('mort')+
+  tm_shape(usgs_plots)+
+  tm_borders('black')
+
+
+library(RODBC)
+
+db = 
+  odbcConnectAccess2007(here::here('02-data', 
+                               '00-source',
+                               'usgs',
+                               'DemogDATABASE2021_10_08.accdb'))
+
+
+
+usgs = 
+  sqlFetch(db, 'allplotarchive') %>%
+  
+  # keep only the two plots from the DX AOI
+  filter(is.element(PLOT, unique(usgs_plots$PLOT)))
+
+usgs %>%
+  group_by(PLOT, YEAR6, YEAR7) %>%
+  summarise()
+# CCRPIPO was visited in 2015/2016 and 2020/2021
+# BBBPIPO was visited in 2017
+
+```
+
+
+# A Gibbs model for tree occurrences
+
+## Background and theory
+
+Notes from the `spatstat` textbook by Baddley et al., chapter 13. I'll bounce 
+back to the earlier material in chapters 9 and 10 as neeeded. 
+
+### 13.2 conditional intensity
+
+A Poisson point process is completely specified by its intensity function 
+$\lambda(u)$. The number of occurrences within some area is a Poisson-distributed 
+draw from the underlying mean, which can vary across space as some 
+linear combination of fixed and/or random effects. The resulting point pattern 
+may exhibit clustering if the intensity surface is not homogeneous. This allows 
+them to represent e.g. tree density across areas of varying suitability. Other 
+processes leading to clustering, such as reproduction, can be represented 
+with Cox and/or cluster models. However, 
+the Poisson model assumes that the occurrences themselves are independent, and 
+cannot capture processes resulting from direct interaction between trees, such 
+as competition. A Gibbs point process, on the other hand, can represent direct 
+interaction between trees. It does so by making the intensity surface for 
+each tree conditional on the observed locations of all the other trees. 
+Basically, the presence of a tree changes the underlying intensity surface 
+(e.g. you can represent competition by making the intensity lower in a 
+neighborhood around existing trees). 

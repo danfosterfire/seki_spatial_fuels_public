@@ -1,0 +1,70 @@
+---
+title: "summary of sensititivy analysis for 1- & 10-hr tallies"
+author: "Lisa Rosenthal"
+date: "2/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+I wanted to see how much I can trim down the Brown's transect protocol without adversely affecting parameters too much. Likely, I will implement a full protocol and a "slim" protocol. I've already decided that I'm not going to collect FWD two samples at each location, which immediately halves that part of the protocol. I analyzed only 1 and 10-hr tallies. The likelihood for litter/duff heights is still TBD and Danny hadn't analyzed the 100-hr tallies yet, so I didn't touch that.
+
+The general model structure is as follows:
+
+$$
+\begin{gathered}
+Y_{xp} \sim NegBinom(\mu_{xp}, \kappa) \\
+log(\mu_{xp}) = a0[groupID] + ap + GP_{xp} \\
+ap \sim Normal(0, \sigma_p) \\
+GP \sim MVNormal(0, K(d)) \\
+[K(d)]_{ij} = \alpha^2 * exp(-.5/\rho^2 * d_{ij}^2) \\
+\end{gathered}
+$$
+
+where $Y_{xp}$, tallies of FWD at location $x$ in plot $p$, are modeled with a negative binomial likelihood. The expected value is predicted by a fixed effect, $groupID$, which in this case with Danny's Crystal cavel data is mortality class. It also varies by plot ID, $ap$ and a GP intercept, which takes into account spatial autocorrelation bewteen neighboring fuels within a plot. The covariance function $K(d)$ varies with respect to distance $d$ and is predicted by two spatial parameters, $\alpha$ and $\rho$, which affect the strength and length, respectively. Unlike Danny's analysis, I didn't bother varying $\alpha$ and $\rho$ by mortality class because I'm anticipating all the plots in the Crystal Cave area to roughly belong to one fuel type.  
+
+I asked how do the posteriors change when I alter: 
+
+- number of plots
+- number of transects within each plot
+- number of subsamples within each plot
+
+### Number of plots
+
+I ran the above model, varying the number of plots included in the dataset. I sampled Danny's data with replacement with a sample size of 3,6, 9, 12, 15, 21, 24, 30 total plots, with 5 sets each. Plots were equally balanced across the three mortality classes. When the same plot appeared more than once in the resampled dataset, I considered them to have different plot IDs. This will artificially reduce the the plot-level variance, among other things. 
+
+```{r echo=FALSE,out.width="60%", out.height="30%",fig.cap="Posteriors with respect to number of plots.",fig.show='hold',fig.align='center'}
+knitr::include_graphics('../02-data/06-results/sensitivity/FWD1_10h_nplots.png')
+```
+
+Throughout all of these sensitivity analyses, Rho is the most data-hungry parameter and more plots or samples is always better. That said, it seems safe to say that the posteriors start to level off around 12 plots per fuel type. Danny had 21 plots for reference.  
+
+### Number of transects
+
+I altered the number of transects, including 2, 3, or 4. For the models with 2 or 3 transects, I considered all of the possible combinations (eg. azimuths of 0 and 180 AND 90 and 270) and joined their draws from the posteriors together as an ensemble. This in effect creates a weighted regression from those azimuth combos. 
+
+```{r echo=FALSE,out.width="60%", out.height="30%",fig.cap="Posteriors with respect to number of transects.",fig.show='hold',fig.align='center'}
+knitr::include_graphics('../02-data/06-results/sensitivity/FWD1_10h_ntransects.png')
+```
+
+Most parameters are estimated almost equivalently with 3 and 4 transects. However, the estimation of rho suffers using 3 transects. While the median and the 50% HDPI are well matched with 4 transects, a wider interval suggests that 3 transects might not cut it, at least for that parameter. I was also curious to see how these models affected the covariance/correlation function, as it's hard to fully understand the significance of rho and alpha in isolation.  
+
+```{r echo=FALSE,out.width="60%", out.height="30%",fig.cap="Covariance and correlation functions for models of 1-hr fuels with different numbers of transects.",fig.show='hold',fig.align='center'}
+knitr::include_graphics('../02-data/06-results/sensitivity/FWD1h_ntransects_covcor.png')
+```
+
+```{r echo=FALSE,out.width="60%", out.height="30%",fig.cap="Covariance and correlation functions for models of 10-hr fuels with different numbers of transects.",fig.show='hold',fig.align='center'}
+knitr::include_graphics('../02-data/06-results/sensitivity/FWD10h_ntransects_covcor.png')
+```
+
+The impact of fewer transects is less marked for 1-hr fuels, but for 10-hr fuels the GP posterior is noticeably less precise. 
+
+### Number of subsamples
+
+Here I kept 4 transects and all plots, but I altered the number of subsamples along each transect, with 5, 6, 7, and 8 (the current number). 7 and 8 subsamples were pretty indistinguishable. For 7 samples, I eliminated the last sample at 29.5 m since I noticed that the covariance function tended to drop off around 20 m. I'd feel very comfortable going with 7 subsamples. 
+
+```{r echo=FALSE,out.width="60%", out.height="30%",fig.cap="Covariance and correlation functions for models of 10-hr fuels with different numbers of transects.",fig.show='hold',fig.align='center'}
+knitr::include_graphics('../02-data/06-results/sensitivity/FWD1_10h_nsubsamples_realdat.png')
+```
